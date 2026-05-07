@@ -1,39 +1,47 @@
 import 'package:speech_to_text/speech_to_text.dart' as stt;
 
 class VoiceService {
-  // המשתנה שמחזיק את המנוע של גוגל
-  late stt.SpeechToText _speech;
-  bool _isListening = false;
+  stt.SpeechToText _speech = stt.SpeechToText();
+  bool _isAvailable = false;
 
-  // פונקציה 1: אתחול (בודקת שיש מיקרופון ואישור)
-  Future<bool> initialize() async {
-    _speech = stt.SpeechToText();
-    // מנסה להתחבר לשירות
-    bool available = await _speech.initialize(
-      onError: (val) => print('Error: $val'),
-      onStatus: (val) => print('Status: $val'),
-    );
-    return available;
-  }
-
-  // פונקציה 2: הקשבה (מתחילה להקליט)
-  void listen(Function(String) onResult) {
-    if (!_isListening) {
-      _isListening = true;
-      _speech.listen(
-        onResult: (val) {
-          onResult(val.recognizedWords);
-        },
-        localeId: 'he_IL', // <--- קריטי: מכריח עברית
-        cancelOnError: true,
-        listenMode: stt.ListenMode.confirmation,
+  void initialize() async {
+    print("🎤 VoiceService: Initializing...");
+    try {
+      _isAvailable = await _speech.initialize(
+        onStatus: (status) => print('🎤 Status Update: $status'),
+        onError: (errorNotification) =>
+            print('❌ Voice Error: ${errorNotification.errorMsg}'),
       );
+      print("🎤 Initialization Result: Available = $_isAvailable");
+    } catch (e) {
+      print("❌ CRITICAL ERROR in VoiceService: $e");
     }
   }
 
-  // פונקציה 3: עצירה
+  void listen(Function(String) onResult) {
+    if (!_isAvailable) {
+      print("⚠️ VoiceService not available! Cannot listen.");
+      initialize();
+      return;
+    }
+
+    print("🎤 Starting to listen...");
+    _speech.listen(
+      onResult: (val) {
+        print("🗣️ Heard raw words: ${val.recognizedWords}");
+        onResult(val.recognizedWords);
+      },
+      localeId: 'he_IL',
+      listenFor: Duration(seconds: 10),
+      pauseFor: Duration(seconds: 3),
+      partialResults: true,
+      cancelOnError: true,
+      listenMode: stt.ListenMode.dictation,
+    );
+  }
+
   void stop() {
+    print("🛑 VoiceService: Stop called");
     _speech.stop();
-    _isListening = false;
   }
 }

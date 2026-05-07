@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
-# server.py – הגרסה החכמה והמתוקנת לזיהוי עברית מדויק
+# server.py – גרסה מעודכנת: גלילה דינמית + ניהול מצלמה מרחוק (Remote AI Control)
 
-import socket, threading, sys
+import socket, threading, sys, subprocess
 from pynput.mouse import Controller as MouseController, Button
 import keyboard as kb
 import pyautogui
@@ -11,28 +11,24 @@ from thefuzz import process, fuzz
 HOST = '0.0.0.0'
 COMMAND_PORT = 5000
 DISCOVERY_PORT = 5001
-SCROLL_STEP = 100
 
 mouse = MouseController()
 scale_value = 1.6667
 running = True
+is_dragging = False 
+head_track_process = None  # משתנה לאחסון תהליך המצלמה
 
-# --- מילון הפקודות המלא (כולל הקיצורים החדשים) ---
 COMMAND_MAPPINGS = {
-    # עכבר
-    "RIGHT_CLICK": ["right click", "right", "רייט קליק", "רייט", "ראית", "ימין", "צד ימין"],
-    "LEFT_CLICK": ["left click", "left", "לפט קליק", "לפט", "שמאל", "קליק", "תעשה קליק"],
-    "SCROLL_DOWN": ["scroll down", "down", "דאון", "למטה", "תרד", "גלילה למטה"],
-    "SCROLL_UP": ["scroll up", "up", "אפ", "למעלה", "תעלה", "גלילה למעלה"],
-    
-    # קיצורים (הוספנו בדיוק את המילים שראית בלוגים)
-    "HOTKEY_CTRL_C": ["copy", "העתק", "קופי", "תעתיק", "תעשה העתק"],
+    "RIGHT_CLICK": ["right click", "right", "רייט קליק", "רייט", "ימין"],
+    "LEFT_CLICK": ["left click", "left", "לפט קליק", "לפט", "שמאל", "קליק"],
+    "HOTKEY_CTRL_C": ["copy", "העתק", "קופי", "תעתיק"],
     "HOTKEY_CTRL_V": ["paste", "הדבק", "פייסט", "תדביק"],
     "HOTKEY_CTRL_X": ["cut", "גזור", "קאט", "תגזור"],
     "HOTKEY_CTRL_Z": ["undo", "בטל", "אנדו", "חזור אחורה"],
     "HOTKEY_CTRL_S": ["save", "שמור", "סייב", "תשמור"],
-    "HOTKEY_ALT_TAB": ["switch", "החלף חלון", "אלט טאב", "טאב", "חלון הבא"],
-    "HOTKEY_ENTER": ["enter", "אנטר", "כנס", "שורה חדשה"]
+    "HOTKEY_CTRL_F": ["find", "search", "חפש", "חיפוש", "תמצא"],
+    "HOTKEY_ENTER": ["enter", "אנטר", "כנס", "שורה חדשה"],
+    "TOGGLE_SELECTION": ["select", "mark", "סמן", "בחירה", "סלקט", "תסמן"]
 }
 
 def parse_hotkey(name: str):
@@ -42,8 +38,8 @@ def parse_hotkey(name: str):
 def press_combo(keys):
     try:
         combo = '+'.join(keys)
-        if combo == 'ctrl+c':
-            pyautogui.hotkey('ctrl', 'c')
+        if combo == 'ctrl+c' or combo == 'ctrl+f': 
+            pyautogui.hotkey(*keys)
         else:
             kb.send(combo, do_press=True, do_release=True)
         print(f"✔ Executed Combo: {combo}")
@@ -51,57 +47,95 @@ def press_combo(keys):
         print(f"❌ Error: {e}")
 
 def handle_internal_command(action):
-    if action == "SCROLL_UP":
-        mouse.scroll(0, SCROLL_STEP)
-    elif action == "SCROLL_DOWN":
-        mouse.scroll(0, -SCROLL_STEP)
-    elif action == "LEFT_CLICK":
+    global is_dragging
+    if action == "LEFT_CLICK":
         mouse.click(Button.left)
     elif action == "RIGHT_CLICK":
         mouse.click(Button.right)
+    elif action == "TOGGLE_SELECTION":
+        if not is_dragging:
+            mouse.press(Button.left)
+            is_dragging = True
+            print("🔹 Selection Mode: ON")
+        else:
+            mouse.release(Button.left)
+            is_dragging = False
+            print("🔸 Selection Mode: OFF")
     elif action.startswith("HOTKEY_"):
-        # חילוץ המקשים מתוך השם (למשל HOTKEY_CTRL_C -> ['ctrl', 'c'])
         key_string = action.replace("HOTKEY_", "")
         keys = parse_hotkey(key_string)
-        if keys:
-            press_combo(keys)
+        if keys: press_combo(keys)
 
 def handle_smart_voice(text):
     text = text.lower().strip()
     print(f"🔍 Analyzing voice: '{text}'")
-
     best_score = 0
     best_action = None
-
-    # שלב 1: בדיקה מהירה (בדיוק במילון?)
     for action, keywords in COMMAND_MAPPINGS.items():
         if text in keywords:
-            print(f"🎯 Exact match found! '{text}' -> {action}")
             handle_internal_command(action)
-            return # מצאנו, סיימנו
-
-    # שלב 2: אם לא מצאנו בול, נפעיל AI
+            return 
     for action, keywords in COMMAND_MAPPINGS.items():
         match, score = process.extractOne(text, keywords, scorer=fuzz.ratio)
         if score > best_score:
             best_score = score
             best_action = action
-
-    # סף זיהוי (הורדנו ל-60 כדי לתפוס יותר וריאציות)
     if best_score >= 60:
         print(f"🤖 Fuzzy Match: '{text}' -> {best_action} ({best_score}%)")
         handle_internal_command(best_action)
     else:
-        print(f"🤷‍♂️ Not understood: '{text}' (Best: {best_action} at {best_score}%)")
+        print(f"🤷‍♂️ Not understood: '{text}'")
 
 def handle_command(cmd: str):
-    global scale_value
+    global scale_value, head_track_process
     try:
         parts = cmd.strip().split(':')
         action = parts[0].strip()
 
+        # --- פקודות שליטה במצלמה (App Control) ---
+        if action == "START_CAMERA":
+            if head_track_process is None:
+                try:
+                    # הפעלת ה-AI כתהליך נפרד ברקע
+                    head_track_process = subprocess.Popen([sys.executable, 'head_track_poc.py'])
+                    print("📷 Camera AI Started via App")
+                except Exception as e:
+                    print(f"❌ Failed to start camera: {e}")
+            return
+
+        if action == "STOP_CAMERA":
+            if head_track_process is not None:
+                head_track_process.terminate()
+                head_track_process = None
+                print("🛑 Camera AI Stopped via App")
+            return
+
+        # --- פקודות גלילה מה-AI ---
+        if action == "SCROLL_DOWN":
+            mouse.scroll(0, -2) 
+            print("🎢 Action: GENTLE SCROLL DOWN")
+            return
+        
+        if action == "SCROLL_UP":
+            mouse.scroll(0, 2)
+            print("🚀 Action: GENTLE SCROLL UP")
+            return
+
+        if action == "SCROLL_RAW":
+            try:
+                velocity = float(parts[1])
+                # הכפלת המהירות כדי שהגלילה תהיה מורגשת יותר ב-PC
+                scroll_amount = -(velocity * 3) 
+                # הדפסה לטרמינל כדי שתראה שזה עובד
+                print(f"☝️ Touch Scroll: {scroll_amount:.1f}") 
+                mouse.scroll(0, scroll_amount)
+            except Exception as e:
+                print(f"❌ Scroll Error: {e}")
+            return
+
         if action == "VOICE_RAW":
             raw_text = parts[1] if len(parts) > 1 else ""
+            print(f"🎤 Voice Command Received: '{raw_text}'")
             handle_smart_voice(raw_text)
             return
 
@@ -112,11 +146,6 @@ def handle_command(cmd: str):
         elif action == "SET_SCALE":
             scale_value = float(parts[1])
             print(f"• Scale set to {scale_value}")
-
-        elif action.startswith("HOTKEY_"):
-             # הפעלה ישירה מהכפתורים באפליקציה
-             handle_internal_command(action)
-        
         else:
             handle_internal_command(action)
 
@@ -150,13 +179,13 @@ def main():
     
     threading.Thread(target=discovery_listener, args=(disc_sock,), daemon=True).start()
 
-    print(f"✅ Server Running (Optimized for Hebrew Commands)")
-    print(f"🎤 Recognizes: Copy, Paste, Undo, Enter, Mouse clicks...")
+    print(f"✅ Server Running - App Camera Control Enabled 🚀")
     
     try:
         command_listener(cmd_sock)
     except KeyboardInterrupt:
         running = False
+        if head_track_process: head_track_process.terminate()
         disc_sock.close()
         cmd_sock.close()
 
